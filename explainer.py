@@ -1,15 +1,32 @@
 import torch
 from tqdm import tqdm
 from torch_geometric.nn import MessagePassing
+from torch_geometric.nn import APPNP
 from torch_geometric.utils import k_hop_subgraph
 import numpy as np
+import logging
+import time
 
-class SISDistortionGraphExplainer(torch.nn.Module):
 
-    def __init__(self, model, log=True, greedy=True):
-        super(SISDistortionGraphExplainer, self).__init__()
+class Zorro(torch.nn.Module):
+
+    def __init__(self, model, device, log=True, greedy=True, record_process_time=False, add_noise=False, samples=100):
+        super(Zorro, self).__init__()
         self.model = model
         self.log = log
+        self.logger = logging.getLogger("explainer")
+        self.device = device
+
+        self.distortion_samples = samples
+
+        self.ensure_improvement = False
+
+        self.add_noise = add_noise
+
+        self.initial_node_improve = [np.nan]
+        self.initial_feature_improve = [np.nan]
+
+        self.record_process_time = record_process_time
 
         self.greedy = greedy
         if self.greedy:
@@ -21,7 +38,10 @@ class SISDistortionGraphExplainer(torch.nn.Module):
         num_hops = 0
         for module in self.model.modules():
             if isinstance(module, MessagePassing):
-                num_hops += 1
+                if isinstance(module, APPNP):
+                    num_hops += module.K
+                else:
+                    num_hops += 1
         return num_hops
 
     def __flow__(self):
@@ -48,7 +68,7 @@ class SISDistortionGraphExplainer(torch.nn.Module):
         return x, edge_index, mapping, edge_mask, kwargs
 
     def distortion(self, node_idx=None, full_feature_matrix=None, computation_graph_feature_matrix=None,
-                   edge_index=None, node_mask=None, feature_mask=None, predicted_label=None, samples=100,
+                   edge_index=None, node_mask=None, feature_mask=None, predicted_label=None, samples=None,
                    random_seed=12345):
         if node_idx is None:
             node_idx = self.node_idx
@@ -71,39 +91,28 @@ class SISDistortionGraphExplainer(torch.nn.Module):
         if predicted_label is None:
             predicted_label = self.predicted_label
 
-        (num_nodes, num_features) = full_feature_matrix.size()
+        if samples is None:
+            samples = self.distortion_samples
 
-        num_nodes_computation_graph = computation_graph_feature_matrix.size(0)
-
-        # retrieve complete mask as matrix
-        mask = node_mask.T.matmul(feature_mask)
-
-        correct = 0
-
-        rng = torch.Generator()
-        rng.manual_seed(random_seed)
-        random_indices = torch.randint(num_nodes, (samples, num_nodes_computation_graph, num_features),
-                                       generator=rng)
-        for i in range(samples):
-            random_features = torch.gather(full_feature_matrix,
-                                           dim=0,
-                                           index=random_indices[i, :, :])
-
-            randomized_features = mask * computation_graph_feature_matrix + (1 - mask) * random_features
-
-            log_logits = self.model(x=randomized_features, edge_index=edge_index)
-            distorted_labels = log_logits.argmax(dim=-1)
-
-            if distorted_labels[node_idx] == predicted_label:
-                correct += 1
-
-        return correct / samples
+        return distortion(self.model,
+                          node_idx=node_idx,
+                          full_feature_matrix=full_feature_matrix,
+                          computation_graph_feature_matrix=computation_graph_feature_matrix,
+                          edge_index=edge_index,
+                          node_mask=node_mask,
+                          feature_mask=feature_mask,
+                          predicted_label=predicted_label,
+                          samples=samples,
+                          random_seed=random_seed,
+                          device=self.device,
+                          )
 
     def argmax_distortion_general(self,
                                   previous_distortion,
                                   possible_elements,
                                   selected_elements,
                                   initialization=False,
+                                  save_initial_improve=False,
                                   **distortion_kwargs,
                                   ):
         if self.greedy:
@@ -121,8 +130,12 @@ class SISDistortionGraphExplainer(torch.nn.Module):
 
                 if selected_elements is self.selected_nodes:
                     self.sorted_possible_nodes = sorted(raw_sorted_elements, key=lambda x: x[1], reverse=True)
+                    if save_initial_improve:
+                        self.initial_node_improve = raw_sorted_elements
                 else:
                     self.sorted_possible_features = sorted(raw_sorted_elements, key=lambda x: x[1], reverse=True)
+                    if save_initial_improve:
+                        self.initial_feature_improve = raw_sorted_elements
 
                 return best_element, best_distortion_improve
 
@@ -132,7 +145,7 @@ class SISDistortionGraphExplainer(torch.nn.Module):
                 else:
                     sorted_elements = self.sorted_possible_features
 
-                restricted_possible_elements = torch.zeros_like(possible_elements)
+                restricted_possible_elements = torch.zeros_like(possible_elements, device=self.device)
 
                 counter = 0
                 for index, initial_distortion_improve in sorted_elements:
@@ -150,13 +163,30 @@ class SISDistortionGraphExplainer(torch.nn.Module):
                 # add selected elements to possible elements to avoid -1 in the calculation of remaining elements
                 restricted_possible_elements += selected_elements
 
-                return self.argmax_distortion_general_full(
+                best_element, best_distortion_improve = self.argmax_distortion_general_full(
                     previous_distortion,
                     restricted_possible_elements,
                     selected_elements,
                     **distortion_kwargs,
                 )
 
+                return best_element, best_distortion_improve
+
+        elif save_initial_improve:
+            best_element, best_distortion_improve, raw_sorted_elements = self.argmax_distortion_general_full(
+                previous_distortion,
+                possible_elements,
+                selected_elements,
+                save_all_pairs=True,
+                **distortion_kwargs,
+            )
+
+            if selected_elements is self.selected_nodes:
+                self.initial_node_improve = raw_sorted_elements
+            else:
+                self.initial_feature_improve = raw_sorted_elements
+
+            return best_element, best_distortion_improve
         else:
             return self.argmax_distortion_general_full(
                 previous_distortion,
@@ -220,9 +250,15 @@ class SISDistortionGraphExplainer(torch.nn.Module):
         else:
             return best_element, best_distortion_improve
 
-    def _determine_minimal_set(self, initial_distortion, tau, possible_nodes, possible_features):
+    def _determine_minimal_set(self, initial_distortion, tau, possible_nodes, possible_features,
+                               save_initial_improve=False):
         current_distortion = initial_distortion
-        executed_selections = [[None, None, current_distortion]]
+        if self.record_process_time:
+            last_time = time.time()
+            executed_selections = [[np.nan, np.nan, current_distortion, 0]]
+        else:
+            last_time = 0
+            executed_selections = [[np.nan, np.nan, current_distortion]]
 
         num_selected_nodes = 0
         num_selected_features = 0
@@ -236,6 +272,7 @@ class SISDistortionGraphExplainer(torch.nn.Module):
                     self.selected_nodes,
                     initialization=True,
                     feature_mask=possible_features,  # assume all features are selected
+                    save_initial_improve=save_initial_improve,
                 )
 
                 best_feature, improve_in_distortion_by_feature = self.argmax_distortion_general(
@@ -244,6 +281,7 @@ class SISDistortionGraphExplainer(torch.nn.Module):
                     self.selected_features,
                     initialization=True,
                     node_mask=possible_nodes,  # assume all nodes are selected
+                    save_initial_improve=save_initial_improve,
                 )
 
             elif num_selected_features == 0:
@@ -277,31 +315,40 @@ class SISDistortionGraphExplainer(torch.nn.Module):
                     self.selected_features,
                 )
 
+            if self.ensure_improvement and \
+                    improve_in_distortion_by_node < .00000001 and improve_in_distortion_by_feature < .00000001:
+                pass
+
             if best_node is None and best_feature is None:
                 break
 
             if best_node is None:
                 self.selected_features[0, best_feature] = 1
                 num_selected_features += 1
-                executed_selection = [None, best_feature]
+                executed_selection = [np.nan, best_feature]
             elif best_feature is None:
                 self.selected_nodes[0, best_node] = 1
                 num_selected_nodes += 1
-                executed_selection = [best_node, None]
+                executed_selection = [best_node, np.nan]
             elif improve_in_distortion_by_feature >= improve_in_distortion_by_node:
                 # on equal improve prefer feature
                 self.selected_features[0, best_feature] = 1
                 num_selected_features += 1
-                executed_selection = [None, best_feature]
+                executed_selection = [np.nan, best_feature]
             else:
                 self.selected_nodes[0, best_node] = 1
                 num_selected_nodes += 1
-                executed_selection = [best_node, None]
+                executed_selection = [best_node, np.nan]
 
             current_distortion = self.distortion()
 
             print(current_distortion)
             executed_selection.append(current_distortion)
+
+            if self.record_process_time:
+                executed_selection.append(time.time() - last_time)
+                last_time = time.time()
+
             executed_selections.append(executed_selection)
 
             self.epoch += 1
@@ -311,60 +358,73 @@ class SISDistortionGraphExplainer(torch.nn.Module):
 
         return executed_selections
 
-    def recursively_get_minimal_sets(self, initial_distortion, tau, possible_nodes, possible_features):
+    def recursively_get_minimal_sets(self, initial_distortion, tau, possible_nodes, possible_features,
+                                     recursion_depth=np.inf, save_initial_improve=False):
 
-        print("Possible features", int(possible_features.sum()))
-        print("Possible nodes", int(possible_nodes.sum()))
+        self.logger.debug("  Possible features " + str(int(possible_features.sum())))
+        self.logger.debug("  Possible nodes " + str(int(possible_nodes.sum())))
 
         # check maximal possible distortion with current possible nodes and features
         reachable_distortion = self.distortion(
             node_mask=possible_nodes,
             feature_mask=possible_features,
         )
-        print("Maximal reachable distortion in this path", reachable_distortion)
+        self.logger.debug("Maximal reachable distortion in this path " + str(reachable_distortion))
         if reachable_distortion <= 1 - tau:
             return None
 
-        executed_selections = self._determine_minimal_set(initial_distortion, tau, possible_nodes, possible_features)
+        if recursion_depth == 0:
+            return [(np.nan, np.nan, np.nan)]
+
+        executed_selections = self._determine_minimal_set(initial_distortion, tau, possible_nodes, possible_features,
+                                                          save_initial_improve=save_initial_improve)
 
         minimal_nodes_and_features_sets = [
-            (self.selected_nodes.numpy(),
-             self.selected_features.numpy(),
+            (self.selected_nodes.cpu().numpy(),
+             self.selected_features.cpu().numpy(),
              executed_selections)
         ]
 
-        return minimal_nodes_and_features_sets
+        self.logger.debug(" Explanation found")
+        self.logger.debug(" Selected features " + str(int(minimal_nodes_and_features_sets[0][1].sum())))
+        self.logger.debug(" Selected nodes " + str(int(minimal_nodes_and_features_sets[0][0].sum())))
 
-        self.selected_nodes = torch.zeros((1, self.num_computation_graph_nodes))
-        self.selected_features = torch.zeros((1, self.num_features))
+        self.selected_nodes = torch.zeros((1, self.num_computation_graph_nodes), device=self.device)
+        self.selected_features = torch.zeros((1, self.num_features), device=self.device)
 
-        reduced_nodes = possible_nodes - minimal_nodes_and_features_sets[0][0]
-        reduced_features = possible_features - minimal_nodes_and_features_sets[0][1]
+        reduced_nodes = possible_nodes - torch.as_tensor(minimal_nodes_and_features_sets[0][0], device=self.device)
+        reduced_features = possible_features - torch.as_tensor(minimal_nodes_and_features_sets[0][1],
+                                                               device=self.device)
 
         reduced_node_results = self.recursively_get_minimal_sets(
             initial_distortion,
             tau,
             reduced_nodes,
             possible_features,
+            recursion_depth=recursion_depth - 1,
+            save_initial_improve=False,
         )
         if reduced_node_results is not None:
             minimal_nodes_and_features_sets.extend(reduced_node_results)
 
-        self.selected_nodes = torch.zeros((1, self.num_computation_graph_nodes))
-        self.selected_features = torch.zeros((1, self.num_features))
+        self.selected_nodes = torch.zeros((1, self.num_computation_graph_nodes), device=self.device)
+        self.selected_features = torch.zeros((1, self.num_features), device=self.device)
 
         reduced_feature_results = self.recursively_get_minimal_sets(
             initial_distortion,
             tau,
             possible_nodes,
             reduced_features,
+            recursion_depth=recursion_depth - 1,
+            save_initial_improve=False,
         )
         if reduced_feature_results is not None:
             minimal_nodes_and_features_sets.extend(reduced_feature_results)
 
         return minimal_nodes_and_features_sets
 
-    def explain_node(self, node_idx, full_feature_matrix, edge_index, tau=0.15):
+    def explain_node(self, node_idx, full_feature_matrix, edge_index, tau=0.15, recursion_depth=np.inf,
+                     save_initial_improve=False):
         r"""Learns and returns a node feature mask and an edge mask that play a
         crucial role to explain the prediction made by the GNN for node
         :attr:`node_idx`.
@@ -377,18 +437,40 @@ class SISDistortionGraphExplainer(torch.nn.Module):
         :rtype: (:class:`Tensor`, :class:`Tensor`)
         """
 
+        if save_initial_improve:
+            self.initial_node_improve = [np.nan]
+            self.initial_feature_improve = [np.nan]
+
         self.model.eval()
+
+        if recursion_depth <= 0:
+            self.logger.warning("Recursion depth not positve " + str(recursion_depth))
+            raise ValueError("Recursion depth not positve " + str(recursion_depth))
+
+        self.logger.info("------ Start explaining node " + str(node_idx))
+        self.logger.debug("Distortion drop (tau): " + str(tau))
+        self.logger.debug("Distortion samples: " + str(self.distortion_samples))
+        self.logger.debug("Greedy variant: " + str(self.greedy))
+        if self.greedy:
+            self.logger.debug("Greediness: " + str(self.greediness))
+            self.logger.debug("Ensure improvement: " + str(self.ensure_improvement))
 
         num_edges = edge_index.size(1)
 
         (num_nodes, self.num_features) = full_feature_matrix.size()
 
-        self.node_idx = node_idx
         self.full_feature_matrix = full_feature_matrix
 
         # Only operate on a k-hop subgraph around `node_idx`.
         self.computation_graph_feature_matrix, self.computation_graph_edge_index, mapping, hard_edge_mask, kwargs = \
             self.__subgraph__(node_idx, full_feature_matrix, edge_index)
+
+        if self.add_noise:
+            self.full_feature_matrix = torch.cat(
+                [self.full_feature_matrix, torch.zeros_like(self.full_feature_matrix)],
+                dim=0)
+
+        self.node_idx = mapping
 
         self.num_computation_graph_nodes = self.computation_graph_feature_matrix.size(0)
 
@@ -404,46 +486,176 @@ class SISDistortionGraphExplainer(torch.nn.Module):
             self.to(self.computation_graph_feature_matrix.device)
 
             if self.log:  # pragma: no cover
-                self.overall_progress_bar = tqdm(total=int(self.num_computation_graph_nodes*self.num_features),
+                self.overall_progress_bar = tqdm(total=int(self.num_computation_graph_nodes * self.num_features),
                                                  position=1)
                 self.overall_progress_bar.set_description(f'Explain node {node_idx}')
 
-            possible_nodes = torch.ones((1, self.num_computation_graph_nodes))
-            possible_features = torch.ones((1, self.num_features))
+            possible_nodes = torch.ones((1, self.num_computation_graph_nodes), device=self.device)
+            possible_features = torch.ones((1, self.num_features), device=self.device)
 
-            self.selected_nodes = torch.zeros((1, self.num_computation_graph_nodes))
-            self.selected_features = torch.zeros((1, self.num_features))
+            self.selected_nodes = torch.zeros((1, self.num_computation_graph_nodes), device=self.device)
+            self.selected_features = torch.zeros((1, self.num_features), device=self.device)
 
             initial_distortion = self.distortion()
 
-            self.epoch = 1
-            minimal_nodes_and_features_sets = self.recursively_get_minimal_sets(initial_distortion,
-                                                                                tau,
-                                                                                possible_nodes,
-                                                                                possible_features)
+            # safe the unmasked distortion
+            self.logger.debug("Initial distortion without any mask: " + str(initial_distortion))
+
+            if initial_distortion >= 1 - tau:
+                # no mask needed, global distribution enough, see node 1861 in cora_GINConv
+                self.logger.info("------ Finished explaining node " + str(node_idx))
+                self.logger.debug("# Explanations: Select any nodes and features")
+                if save_initial_improve:
+                    return [
+                               (self.selected_nodes.cpu().numpy(),
+                                self.selected_features.cpu().numpy(),
+                                [[np.nan, np.nan, initial_distortion], ]
+                                )
+                           ], None, None
+                else:
+                    return [
+                        (self.selected_nodes.cpu().numpy(),
+                         self.selected_features.cpu().numpy(),
+                         [[np.nan, np.nan, initial_distortion], ]
+                         )
+                    ]
+            else:
+                self.epoch = 1
+                minimal_nodes_and_features_sets = self.recursively_get_minimal_sets(
+                    initial_distortion,
+                    tau,
+                    possible_nodes,
+                    possible_features,
+                    recursion_depth=recursion_depth,
+                    save_initial_improve=save_initial_improve,
+                )
 
             if self.log:  # pragma: no cover
                 self.overall_progress_bar.close()
 
-        return minimal_nodes_and_features_sets
+        self.logger.info("------ Finished explaining node " + str(node_idx))
+        self.logger.debug("# Explanations: " + str(len(minimal_nodes_and_features_sets)))
+
+        if save_initial_improve:
+            return minimal_nodes_and_features_sets, self.initial_node_improve, self.initial_feature_improve
+        else:
+            return minimal_nodes_and_features_sets
 
 
-def save_minimal_nodes_and_features_sets(path_prefix, node, minimal_nodes_and_features_sets):
-    path = path_prefix + "_node_" + str(node) + ".npz"
+def save_minimal_nodes_and_features_sets(save_path, node, minimal_nodes_and_features_sets,
+                                         initial_node_improve=None, initial_feature_improve=None):
+    path = save_path
 
-    numpy_dict = {
-        "node": np.array(node),
-        "number_of_sets": np.array(len(minimal_nodes_and_features_sets)),
-    }
+    if minimal_nodes_and_features_sets is None:
+        numpy_dict = {
+            "node": np.array(node),
+            "number_of_sets": np.array(0),
+        }
 
-    features_label = "features_"
-    nodes_label = "nodes_"
-    selection_label = "selection_"
+    else:
 
-    for i, (selected_nodes, selected_features, executed_selections) in enumerate(minimal_nodes_and_features_sets):
-        numpy_dict[nodes_label + str(i)] = selected_nodes
-        numpy_dict[features_label + str(i)] = selected_features
-        numpy_dict[selection_label + str(i)] = np.array(executed_selections)
+        numpy_dict = {
+            "node": np.array(node),
+            "number_of_sets": np.array(len(minimal_nodes_and_features_sets)),
+        }
+
+        features_label = "features_"
+        nodes_label = "nodes_"
+        selection_label = "selection_"
+
+        for i, (selected_nodes, selected_features, executed_selections) in enumerate(minimal_nodes_and_features_sets):
+            numpy_dict[nodes_label + str(i)] = selected_nodes
+            numpy_dict[features_label + str(i)] = selected_features
+            numpy_dict[selection_label + str(i)] = np.array(executed_selections)
+
+    if initial_node_improve is not None:
+        numpy_dict["initial_node_improve"] = np.array(initial_node_improve)
+
+    if initial_feature_improve is not None:
+        numpy_dict["initial_feature_improve"] = np.array(initial_feature_improve)
 
     np.savez_compressed(path, **numpy_dict)
 
+
+def load_minimal_nodes_and_features_sets(path_prefix, node, check_for_initial_improves=False):
+    path = path_prefix + "_node_" + str(node) + ".npz"
+
+    save = np.load(path, allow_pickle=False)
+
+    saved_node = save["node"]
+    if saved_node != node:
+        raise ValueError("Other node then specified", saved_node, node)
+    number_of_sets = save["number_of_sets"]
+
+    minimal_nodes_and_features_sets = []
+
+    if number_of_sets > 0:
+
+        features_label = "features_"
+        nodes_label = "nodes_"
+        selection_label = "selection_"
+
+        for i in range(number_of_sets):
+            selected_nodes = save[nodes_label + str(i)]
+            selected_features = save[features_label + str(i)]
+            executed_selections = save[selection_label + str(i)]
+
+            minimal_nodes_and_features_sets.append((selected_nodes, selected_features, executed_selections))
+
+    if check_for_initial_improves:
+        try:
+            initial_node_improve = save["initial_node_improve"]
+        except KeyError:
+            initial_node_improve = None
+
+        try:
+            initial_feature_improve = save["initial_feature_improve"]
+        except KeyError:
+            initial_feature_improve = None
+
+        return minimal_nodes_and_features_sets, initial_node_improve, initial_feature_improve
+    else:
+        return minimal_nodes_and_features_sets
+
+
+def distortion(model, node_idx=None, full_feature_matrix=None, computation_graph_feature_matrix=None,
+               edge_index=None, node_mask=None, feature_mask=None, predicted_label=None, samples=None,
+               random_seed=12345, device="cpu", validity=False,
+               ):
+    # conditional_samples=True only works for int feature matrix!
+
+    (num_nodes, num_features) = full_feature_matrix.size()
+
+    num_nodes_computation_graph = computation_graph_feature_matrix.size(0)
+
+    # retrieve complete mask as matrix
+    mask = node_mask.T.matmul(feature_mask)
+
+    if validity:
+        samples = 1
+        full_feature_matrix = torch.zeros_like(full_feature_matrix)
+
+    correct = 0.0
+
+    rng = torch.Generator(device=device)
+    rng.manual_seed(random_seed)
+    random_indices = torch.randint(num_nodes, (samples, num_nodes_computation_graph, num_features),
+                                   generator=rng,
+                                   device=device,
+                                   )
+    random_indices = random_indices.type(torch.int64)
+
+    for i in range(samples):
+        random_features = torch.gather(full_feature_matrix,
+                                       dim=0,
+                                       index=random_indices[i, :, :])
+
+        randomized_features = mask * computation_graph_feature_matrix + (1 - mask) * random_features
+
+        log_logits = model(x=randomized_features, edge_index=edge_index)
+        distorted_labels = log_logits.argmax(dim=-1)
+
+        if distorted_labels[node_idx] == predicted_label:
+            correct += 1
+
+    return correct / samples
