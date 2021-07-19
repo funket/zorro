@@ -1,6 +1,6 @@
 # Valid, Sparse, and Stable Explanations in Graph Neural Networks
 
-##### by Anonymous Authors
+##### by Thorben Funke, Megha Khosla, Mandeep Rathee, and Avishek Anand
 
 
 ## 1. Requirements
