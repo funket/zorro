@@ -124,7 +124,6 @@ if __name__ == "__main__":
     model_classes = {"GCN": GCNNet,
                      "GAT": GATNet,
                      "GINConv": GINConvNet,
-                     "APPNP10Net": APPNP10Net,
                      "APPNP2Net": APPNP2Net,
                      "GCN_syn2": GCN_syn2,
                      }
